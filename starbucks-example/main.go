@@ -47,8 +47,8 @@ func main() {
 		panic(err)
 	}
 
-	// setupTable()
-	// loadData()
+	setupTable()
+	loadData()
 	queryData()
 }
 
