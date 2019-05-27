@@ -120,3 +120,5 @@ Query a rectangular area constructed by two points and return all points within 
 This repository contains a Getting Started example in the folder `starbucks-example` inspired by James Beswick's very good blog post about [Location-based search results with DynamoDB and Geohash](https://read.acloud.guru/location-based-search-results-with-dynamodb-and-geohash-267727e5d54f)
 
 It uses the US Starbucks locations, loads them into DynamoDB in batches of 25 and then retrieves the the locations of all Starbucks in the radius of 5000 meters surrounding Latitude:  40.7769099, Longitude: -73.9822532.
+
+The example illustrates the general usage as well as a hint of the performance. The radius search constantly needs about 20-30ms with the given dataset (approximately 6500 Starbucks coffee shops in the US).
