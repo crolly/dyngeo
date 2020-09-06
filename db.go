@@ -1,6 +1,7 @@
 package dyngeo
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -22,7 +23,7 @@ func newDB(config DynGeoConfig) db {
 	}
 }
 
-func (db db) queryGeoHash(queryInput dynamodb.QueryInput, hashKey uint64, ghr geoHashRange) []*dynamodb.QueryOutput {
+func (db db) queryGeoHash(ctx context.Context, queryInput dynamodb.QueryInput, hashKey uint64, ghr geoHashRange) []*dynamodb.QueryOutput {
 	queryOutputs := []*dynamodb.QueryOutput{}
 
 	keyConditions := map[string]*dynamodb.Condition{
@@ -53,27 +54,37 @@ func (db db) queryGeoHash(queryInput dynamodb.QueryInput, hashKey uint64, ghr ge
 		fmt.Println(err)
 	}
 
-	output, queryOutputs := db.paginateQuery(queryInput, queryOutputs)
+	output, queryOutputs := db.paginateQuery(ctx, queryInput, queryOutputs)
 
 	for output.LastEvaluatedKey != nil {
 		queryInput.ExclusiveStartKey = output.LastEvaluatedKey
-		output, queryOutputs = db.paginateQuery(queryInput, queryOutputs)
+		output, queryOutputs = db.paginateQuery(ctx, queryInput, queryOutputs)
 	}
 
 	return queryOutputs
 }
 
-func (db db) paginateQuery(queryInput dynamodb.QueryInput, queryOutputs []*dynamodb.QueryOutput) (*dynamodb.QueryOutput, []*dynamodb.QueryOutput) {
-	output, err := db.config.DynamoDBClient.Query(&queryInput)
+func (db db) paginateQuery(ctx context.Context, queryInput dynamodb.QueryInput, queryOutputs []*dynamodb.QueryOutput) (*dynamodb.QueryOutput, []*dynamodb.QueryOutput) {
+
+	var out *dynamodb.QueryOutput
+	var err error
+
+	if ctx != nil {
+		out, err = db.config.DynamoDBClient.QueryWithContext(ctx, &queryInput)
+	} else {
+		out, err = db.config.DynamoDBClient.Query(&queryInput)
+	}
 	if err != nil {
 		fmt.Println(err)
 	}
-	queryOutputs = append(queryOutputs, output)
 
-	return output, queryOutputs
+	queryOutputs = append(queryOutputs, out)
+
+	return out, queryOutputs
 }
 
-func (db db) getPoint(input GetPointInput) (*GetPointOutput, error) {
+func (db db) getPoint(ctx context.Context, input GetPointInput) (*GetPointOutput, error) {
+
 	_, hashKey := generateHashes(input.GeoPoint, db.config.HashKeyLength)
 
 	getItemInput := input.GetItemInput
@@ -83,12 +94,20 @@ func (db db) getPoint(input GetPointInput) (*GetPointOutput, error) {
 		db.config.RangeKeyAttributeName: &dynamodb.AttributeValue{S: aws.String(input.RangeKeyValue.String())},
 	}
 
-	out, err := db.config.DynamoDBClient.GetItem(&getItemInput)
+	var out *dynamodb.GetItemOutput
+	var err error
+
+	if ctx != nil {
+		out, err = db.config.DynamoDBClient.GetItemWithContext(ctx, &getItemInput)
+	} else {
+		out, err = db.config.DynamoDBClient.GetItem(&getItemInput)
+	}
 
 	return &GetPointOutput{out}, err
 }
 
-func (db db) putPoint(input PutPointInput) (*PutPointOutput, error) {
+func (db db) putPoint(ctx context.Context, input PutPointInput) (*PutPointOutput, error) {
+
 	geoHash, hashKey := generateHashes(input.GeoPoint, db.config.HashKeyLength)
 	putItemInput := input.PutItemInput
 	putItemInput.TableName = aws.String(db.config.TableName)
@@ -104,12 +123,18 @@ func (db db) putPoint(input PutPointInput) (*PutPointOutput, error) {
 	}
 	putItemInput.Item[db.config.GeoJSONAttributeName] = &dynamodb.AttributeValue{S: aws.String(string(jsonAttr))}
 
-	out, err := db.config.DynamoDBClient.PutItem(&putItemInput)
+	var out *dynamodb.PutItemOutput
+
+	if ctx != nil {
+		out, err = db.config.DynamoDBClient.PutItemWithContext(ctx, &putItemInput)
+	} else {
+		out, err = db.config.DynamoDBClient.PutItem(&putItemInput)
+	}
 
 	return &PutPointOutput{out}, err
 }
 
-func (db db) batchWritePoints(inputs []PutPointInput) (*BatchWritePointOutput, error) {
+func (db db) batchWritePoints(ctx context.Context, inputs []PutPointInput) (*BatchWritePointOutput, error) {
 	writeInputs := []*dynamodb.WriteRequest{}
 	for _, input := range inputs {
 		geoHash, hashKey := generateHashes(input.GeoPoint, db.config.HashKeyLength)
@@ -131,16 +156,25 @@ func (db db) batchWritePoints(inputs []PutPointInput) (*BatchWritePointOutput, e
 		writeInputs = append(writeInputs, &dynamodb.WriteRequest{PutRequest: &putRequest})
 	}
 
-	out, err := db.config.DynamoDBClient.BatchWriteItem(&dynamodb.BatchWriteItemInput{
+	batchWriteItemInput := &dynamodb.BatchWriteItemInput{
 		RequestItems: map[string][]*dynamodb.WriteRequest{
 			db.config.TableName: writeInputs,
 		},
-	})
+	}
+
+	var out *dynamodb.BatchWriteItemOutput
+	var err error
+
+	if ctx != nil {
+		out, err = db.config.DynamoDBClient.BatchWriteItemWithContext(ctx, batchWriteItemInput)
+	} else {
+		out, err = db.config.DynamoDBClient.BatchWriteItem(batchWriteItemInput)
+	}
 
 	return &BatchWritePointOutput{out}, err
 }
 
-func (db db) updatePoint(input UpdatePointInput) (*UpdatePointOutput, error) {
+func (db db) updatePoint(ctx context.Context, input UpdatePointInput) (*UpdatePointOutput, error) {
 	_, hashKey := generateHashes(input.GeoPoint, db.config.HashKeyLength)
 
 	input.UpdateItemInput.TableName = aws.String(db.config.TableName)
@@ -157,12 +191,19 @@ func (db db) updatePoint(input UpdatePointInput) (*UpdatePointOutput, error) {
 		delete(input.UpdateItemInput.AttributeUpdates, db.config.GeoJSONAttributeName)
 	}
 
-	out, err := db.config.DynamoDBClient.UpdateItem(&input.UpdateItemInput)
+	var out *dynamodb.UpdateItemOutput
+	var err error
+
+	if ctx != nil {
+		out, err = db.config.DynamoDBClient.UpdateItemWithContext(ctx, &input.UpdateItemInput)
+	} else {
+		out, err = db.config.DynamoDBClient.UpdateItem(&input.UpdateItemInput)
+	}
 
 	return &UpdatePointOutput{out}, err
 }
 
-func (db db) deletePoint(input DeletePointInput) (*DeletePointOutput, error) {
+func (db db) deletePoint(ctx context.Context, input DeletePointInput) (*DeletePointOutput, error) {
 	_, hashKey := generateHashes(input.GeoPoint, db.config.HashKeyLength)
 
 	deleteItemInput := input.DeleteItemInput
@@ -171,7 +212,15 @@ func (db db) deletePoint(input DeletePointInput) (*DeletePointOutput, error) {
 		db.config.HashKeyAttributeName:  &dynamodb.AttributeValue{N: aws.String(strconv.FormatUint(hashKey, 10))},
 		db.config.RangeKeyAttributeName: &dynamodb.AttributeValue{S: aws.String(input.RangeKeyValue.String())},
 	}
-	out, err := db.config.DynamoDBClient.DeleteItem(&deleteItemInput)
+
+	var out *dynamodb.DeleteItemOutput
+	var err error
+
+	if ctx != nil {
+		out, err = db.config.DynamoDBClient.DeleteItemWithContext(ctx, &deleteItemInput)
+	} else {
+		out, err = db.config.DynamoDBClient.DeleteItem(&deleteItemInput)
+	}
 
 	return &DeletePointOutput{out}, err
 }
