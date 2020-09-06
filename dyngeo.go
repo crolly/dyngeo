@@ -1,6 +1,7 @@
 package dyngeo
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -60,27 +61,56 @@ func New(config DynGeoConfig) (*DynGeo, error) {
 }
 
 func (dg DynGeo) PutPoint(input PutPointInput) (*PutPointOutput, error) {
-	return dg.db.putPoint(input)
+	return dg.db.putPoint(nil, input)
+}
+
+func (dg DynGeo) PutPointWithContext(ctx context.Context, input PutPointInput) (*PutPointOutput, error) {
+	return dg.db.putPoint(ctx, input)
 }
 
 func (dg DynGeo) BatchWritePoints(inputs []PutPointInput) (*BatchWritePointOutput, error) {
-	return dg.db.batchWritePoints(inputs)
+	return dg.db.batchWritePoints(nil, inputs)
+}
+
+func (dg DynGeo) BatchWritePointsWithContext(ctx context.Context, inputs []PutPointInput) (*BatchWritePointOutput, error) {
+	return dg.db.batchWritePoints(ctx, inputs)
 }
 
 func (dg DynGeo) GetPoint(input GetPointInput) (*GetPointOutput, error) {
-	return dg.db.getPoint(input)
+	return dg.db.getPoint(nil, input)
+}
+
+func (dg DynGeo) GetPointWithContext(ctx context.Context, input GetPointInput) (*GetPointOutput, error) {
+	return dg.db.getPoint(ctx, input)
 }
 
 func (dg DynGeo) UpdatePoint(input UpdatePointInput) (*UpdatePointOutput, error) {
-	return dg.db.updatePoint(input)
+	return dg.db.updatePoint(nil, input)
+}
+
+func (dg DynGeo) UpdatePointWithContext(ctx context.Context, input UpdatePointInput) (*UpdatePointOutput, error) {
+	return dg.db.updatePoint(ctx, input)
 }
 
 func (dg DynGeo) DeletePoint(input DeletePointInput) (*DeletePointOutput, error) {
-	return dg.db.deletePoint(input)
+	return dg.db.deletePoint(nil, input)
+}
+
+func (dg DynGeo) DeletePointWithContext(ctx context.Context, input DeletePointInput) (*DeletePointOutput, error) {
+	return dg.db.deletePoint(ctx, input)
 }
 
 func (dg DynGeo) QueryRadius(input QueryRadiusInput, out interface{}) error {
-	output, err := dg.queryRadius(input)
+	output, err := dg.queryRadius(nil, input)
+	if err != nil {
+		return err
+	}
+
+	return dg.unmarshallOutput(output, out)
+}
+
+func (dg DynGeo) QueryRadiusWithContext(ctx context.Context, input QueryRadiusInput, out interface{}) error {
+	output, err := dg.queryRadius(ctx, input)
 	if err != nil {
 		return err
 	}
@@ -89,7 +119,7 @@ func (dg DynGeo) QueryRadius(input QueryRadiusInput, out interface{}) error {
 }
 
 func (dg DynGeo) QueryRectangle(input QueryRectangleInput, out interface{}) error {
-	output, err := dg.queryRectangle(input)
+	output, err := dg.queryRectangle(nil, input)
 	if err != nil {
 		return err
 	}
@@ -97,23 +127,32 @@ func (dg DynGeo) QueryRectangle(input QueryRectangleInput, out interface{}) erro
 	return dg.unmarshallOutput(output, out)
 }
 
-func (dg DynGeo) queryRectangle(input QueryRectangleInput) ([]map[string]*dynamodb.AttributeValue, error) {
+func (dg DynGeo) QueryRectangleWithContext(ctx context.Context, input QueryRectangleInput, out interface{}) error {
+	output, err := dg.queryRectangle(ctx, input)
+	if err != nil {
+		return err
+	}
+
+	return dg.unmarshallOutput(output, out)
+}
+
+func (dg DynGeo) queryRectangle(ctx context.Context, input QueryRectangleInput) ([]map[string]*dynamodb.AttributeValue, error) {
 	latLngRect := rectFromQueryRectangleInput(input)
 	covering := newCovering(dg.Config.s2RegionCoverer.Covering(s2.Region(latLngRect)))
-	results := dg.dispatchQueries(covering, input.GeoQueryInput)
+	results := dg.dispatchQueries(ctx, covering, input.GeoQueryInput)
 
 	return dg.filterByRect(results, input)
 }
 
-func (dg DynGeo) queryRadius(input QueryRadiusInput) ([]map[string]*dynamodb.AttributeValue, error) {
+func (dg DynGeo) queryRadius(ctx context.Context, input QueryRadiusInput) ([]map[string]*dynamodb.AttributeValue, error) {
 	latLngRect := boundingLatLngFromQueryRadiusInput(input)
 	covering := newCovering(dg.Config.s2RegionCoverer.Covering(s2.Region(latLngRect)))
-	results := dg.dispatchQueries(covering, input.GeoQueryInput)
+	results := dg.dispatchQueries(ctx, covering, input.GeoQueryInput)
 
 	return dg.filterByRadius(results, input)
 }
 
-func (dg DynGeo) dispatchQueries(covering covering, input GeoQueryInput) []map[string]*dynamodb.AttributeValue {
+func (dg DynGeo) dispatchQueries(ctx context.Context, covering covering, input GeoQueryInput) []map[string]*dynamodb.AttributeValue {
 	results := [][]*dynamodb.QueryOutput{}
 	wg := &sync.WaitGroup{}
 	mtx := &sync.Mutex{}
@@ -126,7 +165,7 @@ func (dg DynGeo) dispatchQueries(covering covering, input GeoQueryInput) []map[s
 			defer wg.Done()
 			g := hashRanges[i]
 			hashKey := generateHashKey(g.rangeMin, dg.Config.HashKeyLength)
-			output := dg.db.queryGeoHash(input.QueryInput, hashKey, g)
+			output := dg.db.queryGeoHash(ctx, input.QueryInput, hashKey, g)
 			mtx.Lock()
 			results = append(results, output)
 			mtx.Unlock()
