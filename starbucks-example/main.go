@@ -83,8 +83,8 @@ func loadData() {
 		input := dyngeo.PutPointInput{
 			PutItemInput: dynamodb.PutItemInput{
 				Item: map[string]*dynamodb.AttributeValue{
-					"name":    &dynamodb.AttributeValue{S: aws.String(s.Name)},
-					"address": &dynamodb.AttributeValue{S: aws.String(s.Address)},
+					"name":    {S: aws.String(s.Name)},
+					"address": {S: aws.String(s.Address)},
 				},
 			},
 		}

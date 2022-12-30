@@ -1,15 +1,15 @@
 package dyngeo
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
-	"strconv"
+	"log"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/imdario/mergo"
-
-	"github.com/aws/aws-sdk-go/aws"
-
-	"github.com/aws/aws-sdk-go/service/dynamodb"
 )
 
 type db struct {
@@ -22,132 +22,232 @@ func newDB(config DynGeoConfig) db {
 	}
 }
 
-func (db db) queryGeoHash(queryInput dynamodb.QueryInput, hashKey uint64, ghr geoHashRange) []*dynamodb.QueryOutput {
+func (db db) queryGeoHash(ctx context.Context, queryInput dynamodb.QueryInput, hashKey uint64, ghr geoHashRange, limit int) []*dynamodb.QueryOutput {
 	queryOutputs := []*dynamodb.QueryOutput{}
 
-	keyConditions := map[string]*dynamodb.Condition{
-		db.config.HashKeyAttributeName: &dynamodb.Condition{
-			ComparisonOperator: aws.String("EQ"),
-			AttributeValueList: []*dynamodb.AttributeValue{
-				&dynamodb.AttributeValue{N: aws.String(strconv.FormatUint(hashKey, 10))},
-				// &dynamodb.AttributeValue{N: aws.String(strconv.FormatUint(hashKey, 10))},
+	hash, err := attributevalue.Marshal(hashKey)
+	if err != nil {
+		log.Println(err)
+		return queryOutputs
+	}
+
+	rangeMin, err := attributevalue.Marshal(ghr.rangeMin)
+	if err != nil {
+		log.Println(err)
+		return queryOutputs
+	}
+
+	rangeMax, err := attributevalue.Marshal(ghr.rangeMax)
+	if err != nil {
+		log.Println(err)
+		return queryOutputs
+	}
+
+	keyConditions := map[string]types.Condition{
+		db.config.HashKeyAttributeName: {
+			ComparisonOperator: types.ComparisonOperatorEq,
+			AttributeValueList: []types.AttributeValue{
+				hash,
 			},
 		},
-		db.config.GeoHashAttributeName: &dynamodb.Condition{
-			ComparisonOperator: aws.String("BETWEEN"),
-			AttributeValueList: []*dynamodb.AttributeValue{
-				&dynamodb.AttributeValue{N: aws.String(strconv.FormatUint(ghr.rangeMin, 10))},
-				&dynamodb.AttributeValue{N: aws.String(strconv.FormatUint(ghr.rangeMax, 10))},
+		db.config.GeoHashAttributeName: {
+			ComparisonOperator: types.ComparisonOperatorBetween,
+			AttributeValueList: []types.AttributeValue{
+				rangeMin,
+				rangeMax,
 			},
 		},
 	}
+
 	defaultInput := dynamodb.QueryInput{
 		TableName:              aws.String(db.config.TableName),
 		KeyConditions:          keyConditions,
 		IndexName:              aws.String(db.config.GeoHashIndexName),
 		ConsistentRead:         aws.Bool(db.config.ConsistentRead),
-		ReturnConsumedCapacity: aws.String("TOTAL"),
+		ReturnConsumedCapacity: types.ReturnConsumedCapacityTotal,
 	}
 
 	if err := mergo.Merge(&queryInput, defaultInput); err != nil {
-		fmt.Println(err)
+		log.Println(err)
+		return nil
 	}
 
-	output, queryOutputs := db.paginateQuery(queryInput, queryOutputs)
+	output, queryOutputs := db.paginateQuery(ctx, queryInput, queryOutputs)
 
-	for output.LastEvaluatedKey != nil {
+	// if you provide a limit less than 0 - it means you want to loop for ALL entries in the range
+	// otherwise - loop until reach the limit, or you hit the end of the query
+	iteration := 1
+	iterationUntilDone := limit < 0
+	for iterationUntilDone || iteration < limit {
+		if output.LastEvaluatedKey == nil {
+			break
+		}
+
 		queryInput.ExclusiveStartKey = output.LastEvaluatedKey
-		output, queryOutputs = db.paginateQuery(queryInput, queryOutputs)
+		output, queryOutputs = db.paginateQuery(ctx, queryInput, queryOutputs)
+		iteration++
 	}
 
 	return queryOutputs
 }
 
-func (db db) paginateQuery(queryInput dynamodb.QueryInput, queryOutputs []*dynamodb.QueryOutput) (*dynamodb.QueryOutput, []*dynamodb.QueryOutput) {
-	output, err := db.config.DynamoDBClient.Query(&queryInput)
+func (db db) paginateQuery(ctx context.Context, queryInput dynamodb.QueryInput, queryOutputs []*dynamodb.QueryOutput) (*dynamodb.QueryOutput, []*dynamodb.QueryOutput) {
+	output, err := db.config.DynamoDBClient.Query(ctx, &queryInput)
 	if err != nil {
-		fmt.Println(err)
+		log.Println(err)
 	}
 	queryOutputs = append(queryOutputs, output)
-
 	return output, queryOutputs
 }
 
-func (db db) getPoint(input GetPointInput) (*GetPointOutput, error) {
+func (db db) getPoint(ctx context.Context, input GetPointInput) (*GetPointOutput, error) {
 	_, hashKey := generateHashes(input.GeoPoint, db.config.HashKeyLength)
+
+	hash, err := attributevalue.Marshal(hashKey)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+
+	rng, err := attributevalue.Marshal(input.RangeKeyValue)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
 
 	getItemInput := input.GetItemInput
 	getItemInput.TableName = aws.String(db.config.TableName)
-	getItemInput.Key = map[string]*dynamodb.AttributeValue{
-		db.config.HashKeyAttributeName:  &dynamodb.AttributeValue{N: aws.String(strconv.FormatUint(hashKey, 10))},
-		db.config.RangeKeyAttributeName: &dynamodb.AttributeValue{S: aws.String(input.RangeKeyValue.String())},
+	getItemInput.Key = map[string]types.AttributeValue{
+		db.config.HashKeyAttributeName:  hash,
+		db.config.RangeKeyAttributeName: rng,
 	}
 
-	out, err := db.config.DynamoDBClient.GetItem(&getItemInput)
+	out, err := db.config.DynamoDBClient.GetItem(ctx, &getItemInput)
 
 	return &GetPointOutput{out}, err
 }
 
-func (db db) putPoint(input PutPointInput) (*PutPointOutput, error) {
+func (db db) putPoint(ctx context.Context, input PutPointInput) (*PutPointOutput, error) {
 	geoHash, hashKey := generateHashes(input.GeoPoint, db.config.HashKeyLength)
+
+	hash, err := attributevalue.Marshal(hashKey)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+
+	rng, err := attributevalue.Marshal(input.RangeKeyValue)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+
+	geo, err := attributevalue.Marshal(geoHash)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+
 	putItemInput := input.PutItemInput
 	putItemInput.TableName = aws.String(db.config.TableName)
 	putItemInput.Item = input.PutItemInput.Item
-
-	putItemInput.Item[db.config.HashKeyAttributeName] = &dynamodb.AttributeValue{N: aws.String(strconv.FormatUint(hashKey, 10))}
-	putItemInput.Item[db.config.RangeKeyAttributeName] = &dynamodb.AttributeValue{S: aws.String(input.RangeKeyValue.String())}
-	putItemInput.Item[db.config.GeoHashAttributeName] = &dynamodb.AttributeValue{N: aws.String(strconv.FormatUint(geoHash, 10))}
+	putItemInput.Item[db.config.HashKeyAttributeName] = hash
+	putItemInput.Item[db.config.RangeKeyAttributeName] = rng
+	putItemInput.Item[db.config.GeoHashAttributeName] = geo
 
 	jsonAttr, err := json.Marshal(newGeoJSONAttribute(input.GeoPoint, db.config.LongitudeFirst))
 	if err != nil {
 		return nil, err
 	}
-	putItemInput.Item[db.config.GeoJSONAttributeName] = &dynamodb.AttributeValue{S: aws.String(string(jsonAttr))}
 
-	out, err := db.config.DynamoDBClient.PutItem(&putItemInput)
+	jsonAttrVal, err := attributevalue.Marshal(jsonAttr)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+
+	putItemInput.Item[db.config.GeoJSONAttributeName] = jsonAttrVal
+
+	out, err := db.config.DynamoDBClient.PutItem(ctx, &putItemInput)
 
 	return &PutPointOutput{out}, err
 }
 
-func (db db) batchWritePoints(inputs []PutPointInput) (*BatchWritePointOutput, error) {
-	writeInputs := []*dynamodb.WriteRequest{}
+func (db db) batchWritePoints(ctx context.Context, inputs []PutPointInput) (*BatchWritePointOutput, error) {
+	writeInputs := []types.WriteRequest{}
 	for _, input := range inputs {
 		geoHash, hashKey := generateHashes(input.GeoPoint, db.config.HashKeyLength)
-		putItemInput := input.PutItemInput
 
-		putRequest := dynamodb.PutRequest{
+		geo, err := attributevalue.Marshal(geoHash)
+		if err != nil {
+			log.Println(err)
+			return nil, err
+		}
+
+		hash, err := attributevalue.Marshal(hashKey)
+		if err != nil {
+			log.Println(err)
+			return nil, err
+		}
+
+		rng, err := attributevalue.Marshal(input.RangeKeyValue)
+		if err != nil {
+			log.Println(err)
+			return nil, err
+		}
+
+		putItemInput := input.PutItemInput
+		putRequest := types.PutRequest{
 			Item: putItemInput.Item,
 		}
-		putRequest.Item[db.config.HashKeyAttributeName] = &dynamodb.AttributeValue{N: aws.String(strconv.FormatUint(hashKey, 10))}
-		putRequest.Item[db.config.RangeKeyAttributeName] = &dynamodb.AttributeValue{S: aws.String(input.RangeKeyValue.String())}
-		putRequest.Item[db.config.GeoHashAttributeName] = &dynamodb.AttributeValue{N: aws.String(strconv.FormatUint(geoHash, 10))}
+		putRequest.Item[db.config.HashKeyAttributeName] = hash
+		putRequest.Item[db.config.RangeKeyAttributeName] = rng
+		putRequest.Item[db.config.GeoHashAttributeName] = geo
 
 		jsonAttr, err := json.Marshal(newGeoJSONAttribute(input.GeoPoint, db.config.LongitudeFirst))
 		if err != nil {
 			return nil, err
 		}
-		putRequest.Item[db.config.GeoJSONAttributeName] = &dynamodb.AttributeValue{S: aws.String(string(jsonAttr))}
 
-		writeInputs = append(writeInputs, &dynamodb.WriteRequest{PutRequest: &putRequest})
+		jsonAttrVal, err := attributevalue.Marshal(jsonAttr)
+		if err != nil {
+			log.Println(err)
+			return nil, err
+		}
+
+		putRequest.Item[db.config.GeoJSONAttributeName] = jsonAttrVal
+
+		writeInputs = append(writeInputs, types.WriteRequest{PutRequest: &putRequest})
 	}
 
-	out, err := db.config.DynamoDBClient.BatchWriteItem(&dynamodb.BatchWriteItemInput{
-		RequestItems: map[string][]*dynamodb.WriteRequest{
+	bachWriteItemInput := &dynamodb.BatchWriteItemInput{
+		RequestItems: map[string][]types.WriteRequest{
 			db.config.TableName: writeInputs,
 		},
-	})
+	}
 
+	out, err := db.config.DynamoDBClient.BatchWriteItem(ctx, bachWriteItemInput)
 	return &BatchWritePointOutput{out}, err
 }
 
-func (db db) updatePoint(input UpdatePointInput) (*UpdatePointOutput, error) {
+func (db db) updatePoint(ctx context.Context, input UpdatePointInput) (*UpdatePointOutput, error) {
 	_, hashKey := generateHashes(input.GeoPoint, db.config.HashKeyLength)
+
+	hash, err := attributevalue.Marshal(hashKey)
+	if err != nil {
+		return nil, err
+	}
+
+	rgk, err := attributevalue.Marshal(input.RangeKeyValue)
+	if err != nil {
+		return nil, err
+	}
 
 	input.UpdateItemInput.TableName = aws.String(db.config.TableName)
 	if input.UpdateItemInput.Key == nil {
-		input.UpdateItemInput.Key = map[string]*dynamodb.AttributeValue{
-			db.config.HashKeyAttributeName:  &dynamodb.AttributeValue{N: aws.String(strconv.FormatUint(hashKey, 10))},
-			db.config.RangeKeyAttributeName: &dynamodb.AttributeValue{S: aws.String(input.RangeKeyValue.String())},
+		input.UpdateItemInput.Key = map[string]types.AttributeValue{
+			db.config.HashKeyAttributeName:  hash,
+			db.config.RangeKeyAttributeName: rgk,
 		}
 	}
 
@@ -157,21 +257,32 @@ func (db db) updatePoint(input UpdatePointInput) (*UpdatePointOutput, error) {
 		delete(input.UpdateItemInput.AttributeUpdates, db.config.GeoJSONAttributeName)
 	}
 
-	out, err := db.config.DynamoDBClient.UpdateItem(&input.UpdateItemInput)
+	out, err := db.config.DynamoDBClient.UpdateItem(ctx, &input.UpdateItemInput)
 
 	return &UpdatePointOutput{out}, err
 }
 
-func (db db) deletePoint(input DeletePointInput) (*DeletePointOutput, error) {
+func (db db) deletePoint(ctx context.Context, input DeletePointInput) (*DeletePointOutput, error) {
 	_, hashKey := generateHashes(input.GeoPoint, db.config.HashKeyLength)
+
+	hash, err := attributevalue.Marshal(hashKey)
+	if err != nil {
+		return nil, err
+	}
+
+	rgk, err := attributevalue.Marshal(input.RangeKeyValue)
+	if err != nil {
+		return nil, err
+	}
 
 	deleteItemInput := input.DeleteItemInput
 	deleteItemInput.TableName = aws.String(db.config.TableName)
-	deleteItemInput.Key = map[string]*dynamodb.AttributeValue{
-		db.config.HashKeyAttributeName:  &dynamodb.AttributeValue{N: aws.String(strconv.FormatUint(hashKey, 10))},
-		db.config.RangeKeyAttributeName: &dynamodb.AttributeValue{S: aws.String(input.RangeKeyValue.String())},
+	deleteItemInput.Key = map[string]types.AttributeValue{
+		db.config.HashKeyAttributeName:  hash,
+		db.config.RangeKeyAttributeName: rgk,
 	}
-	out, err := db.config.DynamoDBClient.DeleteItem(&deleteItemInput)
+
+	out, err := db.config.DynamoDBClient.DeleteItem(ctx, &deleteItemInput)
 
 	return &DeletePointOutput{out}, err
 }
@@ -179,49 +290,49 @@ func (db db) deletePoint(input DeletePointInput) (*DeletePointOutput, error) {
 func GetCreateTableRequest(config DynGeoConfig) *dynamodb.CreateTableInput {
 	return &dynamodb.CreateTableInput{
 		TableName: aws.String(config.TableName),
-		ProvisionedThroughput: &dynamodb.ProvisionedThroughput{
+		ProvisionedThroughput: &types.ProvisionedThroughput{
 			ReadCapacityUnits:  aws.Int64(10),
 			WriteCapacityUnits: aws.Int64(5),
 		},
-		KeySchema: []*dynamodb.KeySchemaElement{
-			&dynamodb.KeySchemaElement{
-				KeyType:       aws.String("HASH"),
+		KeySchema: []types.KeySchemaElement{
+			{
+				KeyType:       types.KeyTypeHash,
 				AttributeName: aws.String(config.HashKeyAttributeName),
 			},
-			&dynamodb.KeySchemaElement{
-				KeyType:       aws.String("RANGE"),
+			{
+				KeyType:       types.KeyTypeRange,
 				AttributeName: aws.String(config.RangeKeyAttributeName),
 			},
 		},
-		AttributeDefinitions: []*dynamodb.AttributeDefinition{
-			&dynamodb.AttributeDefinition{
+		AttributeDefinitions: []types.AttributeDefinition{
+			{
 				AttributeName: aws.String(config.HashKeyAttributeName),
-				AttributeType: aws.String("N"),
+				AttributeType: types.ScalarAttributeTypeN,
 			},
-			&dynamodb.AttributeDefinition{
+			{
 				AttributeName: aws.String(config.RangeKeyAttributeName),
-				AttributeType: aws.String("S"),
+				AttributeType: types.ScalarAttributeTypeS,
 			},
-			&dynamodb.AttributeDefinition{
+			{
 				AttributeName: aws.String(config.GeoHashAttributeName),
-				AttributeType: aws.String("N"),
+				AttributeType: types.ScalarAttributeTypeN,
 			},
 		},
-		LocalSecondaryIndexes: []*dynamodb.LocalSecondaryIndex{
-			&dynamodb.LocalSecondaryIndex{
+		LocalSecondaryIndexes: []types.LocalSecondaryIndex{
+			{
 				IndexName: aws.String(config.GeoHashIndexName),
-				KeySchema: []*dynamodb.KeySchemaElement{
-					&dynamodb.KeySchemaElement{
-						KeyType:       aws.String("HASH"),
+				KeySchema: []types.KeySchemaElement{
+					{
+						KeyType:       types.KeyTypeHash,
 						AttributeName: aws.String(config.HashKeyAttributeName),
 					},
-					&dynamodb.KeySchemaElement{
-						KeyType:       aws.String("RANGE"),
+					{
+						KeyType:       types.KeyTypeRange,
 						AttributeName: aws.String(config.GeoHashAttributeName),
 					},
 				},
-				Projection: &dynamodb.Projection{
-					ProjectionType: aws.String("ALL"),
+				Projection: &types.Projection{
+					ProjectionType: types.ProjectionTypeAll,
 				},
 			},
 		},

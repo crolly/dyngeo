@@ -1,7 +1,7 @@
 package dyngeo
 
 import (
-	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/golang/geo/s2"
 )
 
@@ -19,7 +19,7 @@ type DynGeoConfig struct {
 	HashKeyLength         int8
 	LongitudeFirst        bool
 
-	DynamoDBClient  *dynamodb.DynamoDB
+	DynamoDBClient  *dynamodb.Client
 	s2RegionCoverer s2.RegionCoverer
 }
 

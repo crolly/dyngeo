@@ -4,9 +4,8 @@ import (
 	"math"
 	"strconv"
 
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/gofrs/uuid"
-
-	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/golang/geo/s2"
 )
 
@@ -16,8 +15,8 @@ type GeoPoint struct {
 }
 
 type GeoJSONAttribute struct {
-	Type        string
-	Coordinates []float64
+	Type        string    `json:"type"`
+	Coordinates []float64 `json:"coordinates"`
 }
 
 func newGeoJSONAttribute(p GeoPoint, lonFirst bool) GeoJSONAttribute {
@@ -29,7 +28,7 @@ func newGeoJSONAttribute(p GeoPoint, lonFirst bool) GeoJSONAttribute {
 	}
 
 	return GeoJSONAttribute{
-		Type:        "Point",
+		Type:        "POINT",
 		Coordinates: coordinates,
 	}
 }
@@ -119,18 +118,18 @@ func newGeoHashRange(min uint64, max uint64) geoHashRange {
 	}
 }
 
-func (g geoHashRange) tryMerge(r geoHashRange) bool {
-	if r.rangeMin-g.rangeMax <= MERGE_THRESHOLD && r.rangeMin > g.rangeMax {
-		g.rangeMax = r.rangeMax
-		return true
-	}
-	if g.rangeMin-r.rangeMax <= MERGE_THRESHOLD && g.rangeMin > r.rangeMax {
-		g.rangeMin = r.rangeMin
-		return true
-	}
+// func (g *geoHashRange) tryMerge(r geoHashRange) bool {
+// 	if r.rangeMin-g.rangeMax <= MERGE_THRESHOLD && r.rangeMin > g.rangeMax {
+// 		g.rangeMax = r.rangeMax
+// 		return true
+// 	}
+// 	if g.rangeMin-r.rangeMax <= MERGE_THRESHOLD && g.rangeMin > r.rangeMax {
+// 		g.rangeMin = r.rangeMin
+// 		return true
+// 	}
 
-	return false
-}
+// 	return false
+// }
 
 func (g geoHashRange) trySplit(hashKeyLength int8) []geoHashRange {
 	result := []geoHashRange{}
@@ -214,9 +213,9 @@ func generateGeoHash(geoPoint GeoPoint) s2.CellID {
 }
 
 func generateHashKey(geoHash uint64, hashKeyLength int8) uint64 {
-	if geoHash < 0 {
-		hashKeyLength++
-	}
+	// if geoHash < 0 {
+	// 	hashKeyLength++
+	// }
 
 	geoHashString := strconv.FormatUint(geoHash, 10)
 	denominator := math.Pow10(len(geoHashString) - int(hashKeyLength))

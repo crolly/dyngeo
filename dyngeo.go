@@ -1,15 +1,17 @@
 package dyngeo
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"sync"
 
-	"github.com/imdario/mergo"
-
-	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/golang/geo/s2"
+	"github.com/imdario/mergo"
 )
 
 type DynGeo struct {
@@ -59,28 +61,28 @@ func New(config DynGeoConfig) (*DynGeo, error) {
 	}, nil
 }
 
-func (dg DynGeo) PutPoint(input PutPointInput) (*PutPointOutput, error) {
-	return dg.db.putPoint(input)
+func (dg DynGeo) PutPoint(ctx context.Context, input PutPointInput) (*PutPointOutput, error) {
+	return dg.db.putPoint(ctx, input)
 }
 
-func (dg DynGeo) BatchWritePoints(inputs []PutPointInput) (*BatchWritePointOutput, error) {
-	return dg.db.batchWritePoints(inputs)
+func (dg DynGeo) BatchWritePoints(ctx context.Context, inputs []PutPointInput) (*BatchWritePointOutput, error) {
+	return dg.db.batchWritePoints(ctx, inputs)
 }
 
-func (dg DynGeo) GetPoint(input GetPointInput) (*GetPointOutput, error) {
-	return dg.db.getPoint(input)
+func (dg DynGeo) GetPoint(ctx context.Context, input GetPointInput) (*GetPointOutput, error) {
+	return dg.db.getPoint(ctx, input)
 }
 
-func (dg DynGeo) UpdatePoint(input UpdatePointInput) (*UpdatePointOutput, error) {
-	return dg.db.updatePoint(input)
+func (dg DynGeo) UpdatePoint(ctx context.Context, input UpdatePointInput) (*UpdatePointOutput, error) {
+	return dg.db.updatePoint(ctx, input)
 }
 
-func (dg DynGeo) DeletePoint(input DeletePointInput) (*DeletePointOutput, error) {
-	return dg.db.deletePoint(input)
+func (dg DynGeo) DeletePoint(ctx context.Context, input DeletePointInput) (*DeletePointOutput, error) {
+	return dg.db.deletePoint(ctx, input)
 }
 
-func (dg DynGeo) QueryRadius(input QueryRadiusInput, out interface{}) error {
-	output, err := dg.queryRadius(input)
+func (dg DynGeo) QueryRadius(ctx context.Context, input QueryRadiusInput, out interface{}) error {
+	output, err := dg.queryRadius(ctx, input)
 	if err != nil {
 		return err
 	}
@@ -88,8 +90,29 @@ func (dg DynGeo) QueryRadius(input QueryRadiusInput, out interface{}) error {
 	return dg.unmarshallOutput(output, out)
 }
 
-func (dg DynGeo) QueryRectangle(input QueryRectangleInput, out interface{}) error {
-	output, err := dg.queryRectangle(input)
+type GeoHashToLastEvaluatedDBValue map[uint64]map[string]types.AttributeValue
+
+func (dg DynGeo) QueryRadiusPaginated(ctx context.Context, input QueryRadiusInput, hashToLastEvaluatedEntry GeoHashToLastEvaluatedDBValue, limit uint, out interface{}) (GeoHashToLastEvaluatedDBValue, error) {
+	if limit == 0 {
+		return nil, errors.New("invalid limit provided")
+	}
+	output, newHashToLEntry, err := dg.queryRadiusWithPaginatedParams(ctx, input, hashToLastEvaluatedEntry, limit)
+	if err != nil {
+		return nil, err
+	}
+	return newHashToLEntry, dg.unmarshallOutput(output, out)
+}
+
+func (dg DynGeo) queryRadiusWithPaginatedParams(ctx context.Context, input QueryRadiusInput, hashToLastEvaluatedEntry GeoHashToLastEvaluatedDBValue, limit uint) ([]map[string]types.AttributeValue, GeoHashToLastEvaluatedDBValue, error) {
+	latLngRect := boundingLatLngFromQueryRadiusInput(input)
+	covering := newCovering(dg.Config.s2RegionCoverer.Covering(s2.Region(latLngRect)))
+	results, newHashToLEntry := dg.dispatchQueriesWithPagination(ctx, covering, input.GeoQueryInput, hashToLastEvaluatedEntry, limit)
+	filteredEntries, err := dg.filterByRadius(results, input)
+	return filteredEntries, newHashToLEntry, err
+}
+
+func (dg DynGeo) QueryRectangle(ctx context.Context, input QueryRectangleInput, out interface{}) error {
+	output, err := dg.queryRectangle(ctx, input)
 	if err != nil {
 		return err
 	}
@@ -97,23 +120,70 @@ func (dg DynGeo) QueryRectangle(input QueryRectangleInput, out interface{}) erro
 	return dg.unmarshallOutput(output, out)
 }
 
-func (dg DynGeo) queryRectangle(input QueryRectangleInput) ([]map[string]*dynamodb.AttributeValue, error) {
+func (dg DynGeo) queryRectangle(ctx context.Context, input QueryRectangleInput) ([]map[string]types.AttributeValue, error) {
 	latLngRect := rectFromQueryRectangleInput(input)
 	covering := newCovering(dg.Config.s2RegionCoverer.Covering(s2.Region(latLngRect)))
-	results := dg.dispatchQueries(covering, input.GeoQueryInput)
+	results := dg.dispatchQueries(ctx, covering, input.GeoQueryInput)
 
 	return dg.filterByRect(results, input)
 }
 
-func (dg DynGeo) queryRadius(input QueryRadiusInput) ([]map[string]*dynamodb.AttributeValue, error) {
+func (dg DynGeo) queryRadius(ctx context.Context, input QueryRadiusInput) ([]map[string]types.AttributeValue, error) {
 	latLngRect := boundingLatLngFromQueryRadiusInput(input)
 	covering := newCovering(dg.Config.s2RegionCoverer.Covering(s2.Region(latLngRect)))
-	results := dg.dispatchQueries(covering, input.GeoQueryInput)
+	results := dg.dispatchQueries(ctx, covering, input.GeoQueryInput)
 
 	return dg.filterByRadius(results, input)
 }
 
-func (dg DynGeo) dispatchQueries(covering covering, input GeoQueryInput) []map[string]*dynamodb.AttributeValue {
+func (dg DynGeo) dispatchQueriesWithPagination(ctx context.Context, covering covering, input GeoQueryInput, hashToLastEvaluatedEntry GeoHashToLastEvaluatedDBValue, limit uint) ([]map[string]types.AttributeValue, GeoHashToLastEvaluatedDBValue) {
+	var results [][]*dynamodb.QueryOutput
+	wg := &sync.WaitGroup{}
+	mtx := &sync.Mutex{}
+
+	hashRanges := covering.getGeoHashRanges(dg.Config.HashKeyLength)
+	iterations := len(hashRanges)
+	newLastEvaluatedEntries := make(GeoHashToLastEvaluatedDBValue)
+	wg.Add(iterations)
+	for i := 0; i < iterations; i++ {
+		go func(i int, queryInput dynamodb.QueryInput) {
+			defer wg.Done()
+			g := hashRanges[i]
+			hashKey := generateHashKey(g.rangeMin, dg.Config.HashKeyLength)
+			// look into the map to check if there has been a query for this hash before
+			// if there was - reuse the last evaluated key for the hash
+			if hashToLastEvaluatedEntry != nil {
+				if lastEvalKey, ok := hashToLastEvaluatedEntry[hashKey]; ok {
+					// this will only be true when there is in fact no more entries to be processed
+					if lastEvalKey == nil {
+						return
+					}
+					queryInput.ExclusiveStartKey = lastEvalKey
+				}
+			}
+			// query hash and stop if reach the limit
+			output := dg.db.queryGeoHash(ctx, queryInput, hashKey, g, int(limit))
+			if len(output) > 0 {
+				mtx.Lock()
+				newLastEvaluatedEntries[hashKey] = output[len(output)-1].LastEvaluatedKey
+				results = append(results, output)
+				mtx.Unlock()
+			}
+		}(i, input.QueryInput)
+	}
+
+	wg.Wait()
+
+	var mergedResults []map[string]types.AttributeValue
+	for _, o := range results {
+		for _, r := range o {
+			mergedResults = append(mergedResults, r.Items...)
+		}
+	}
+	return mergedResults, newLastEvaluatedEntries
+}
+
+func (dg DynGeo) dispatchQueries(ctx context.Context, covering covering, input GeoQueryInput) []map[string]types.AttributeValue {
 	results := [][]*dynamodb.QueryOutput{}
 	wg := &sync.WaitGroup{}
 	mtx := &sync.Mutex{}
@@ -126,7 +196,7 @@ func (dg DynGeo) dispatchQueries(covering covering, input GeoQueryInput) []map[s
 			defer wg.Done()
 			g := hashRanges[i]
 			hashKey := generateHashKey(g.rangeMin, dg.Config.HashKeyLength)
-			output := dg.db.queryGeoHash(input.QueryInput, hashKey, g)
+			output := dg.db.queryGeoHash(ctx, input.QueryInput, hashKey, g, -1)
 			mtx.Lock()
 			results = append(results, output)
 			mtx.Unlock()
@@ -135,7 +205,7 @@ func (dg DynGeo) dispatchQueries(covering covering, input GeoQueryInput) []map[s
 
 	wg.Wait()
 
-	var mergedResults []map[string]*dynamodb.AttributeValue
+	var mergedResults []map[string]types.AttributeValue
 	for _, o := range results {
 		for _, r := range o {
 			mergedResults = append(mergedResults, r.Items...)
@@ -145,8 +215,8 @@ func (dg DynGeo) dispatchQueries(covering covering, input GeoQueryInput) []map[s
 	return mergedResults
 }
 
-func (dg DynGeo) filterByRect(list []map[string]*dynamodb.AttributeValue, input QueryRectangleInput) ([]map[string]*dynamodb.AttributeValue, error) {
-	var filtered []map[string]*dynamodb.AttributeValue
+func (dg DynGeo) filterByRect(list []map[string]types.AttributeValue, input QueryRectangleInput) ([]map[string]types.AttributeValue, error) {
+	var filtered []map[string]types.AttributeValue
 	latLngRect := rectFromQueryRectangleInput(input)
 
 	for _, item := range list {
@@ -163,8 +233,8 @@ func (dg DynGeo) filterByRect(list []map[string]*dynamodb.AttributeValue, input 
 	return filtered, nil
 }
 
-func (dg DynGeo) filterByRadius(list []map[string]*dynamodb.AttributeValue, input QueryRadiusInput) ([]map[string]*dynamodb.AttributeValue, error) {
-	var filtered []map[string]*dynamodb.AttributeValue
+func (dg DynGeo) filterByRadius(list []map[string]types.AttributeValue, input QueryRadiusInput) ([]map[string]types.AttributeValue, error) {
+	var filtered []map[string]types.AttributeValue
 
 	centerLatLng := s2.LatLngFromDegrees(input.CenterPoint.Latitude, input.CenterPoint.Longitude)
 	radius := input.RadiusInMeter
@@ -183,32 +253,36 @@ func (dg DynGeo) filterByRadius(list []map[string]*dynamodb.AttributeValue, inpu
 	return filtered, nil
 }
 
-func (dg DynGeo) latLngFromItem(item map[string]*dynamodb.AttributeValue) (*s2.LatLng, error) {
-	geoJSON := []byte(*item[dg.Config.GeoJSONAttributeName].S)
-	geoJSONAttr := GeoJSONAttribute{}
-	err := json.Unmarshal(geoJSON, &geoJSONAttr)
-	if err != nil {
-		return nil, err
+func (dg DynGeo) latLngFromItem(item map[string]types.AttributeValue) (*s2.LatLng, error) {
+	switch geo := item[dg.Config.GeoJSONAttributeName].(type) {
+	case *types.AttributeValueMemberB:
+		geoJSONAttr := GeoJSONAttribute{}
+		err := json.Unmarshal(geo.Value, &geoJSONAttr)
+		if err != nil {
+			return nil, err
+		}
+
+		coordinates := geoJSONAttr.Coordinates
+		var lng float64
+		var lat float64
+		if dg.Config.LongitudeFirst {
+			lng = coordinates[0]
+			lat = coordinates[1]
+		} else {
+			lng = coordinates[1]
+			lat = coordinates[0]
+		}
+
+		latLng := s2.LatLngFromDegrees(lat, lng)
+		log.Println(latLng.String())
+		return &latLng, nil
 	}
 
-	coordinates := geoJSONAttr.Coordinates
-	var lng float64
-	var lat float64
-	if dg.Config.LongitudeFirst {
-		lng = coordinates[0]
-		lat = coordinates[1]
-	} else {
-		lng = coordinates[1]
-		lat = coordinates[0]
-	}
-
-	latLng := s2.LatLngFromDegrees(lat, lng)
-
-	return &latLng, nil
+	return nil, errors.New("invalid item at " + dg.Config.GeoJSONAttributeName)
 }
 
-func (dg DynGeo) unmarshallOutput(output []map[string]*dynamodb.AttributeValue, out interface{}) error {
-	err := dynamodbattribute.UnmarshalListOfMaps(output, out)
+func (dg DynGeo) unmarshallOutput(output []map[string]types.AttributeValue, out interface{}) error {
+	err := attributevalue.UnmarshalListOfMaps(output, out)
 	if err != nil {
 		return err
 	}
